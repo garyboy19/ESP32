@@ -7,3 +7,6 @@ firmware/managed_components/
 firmware/dependencies.lock
 *.log
 .DS_Store
+
+__pycache__/
+*.pyc
