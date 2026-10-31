@@ -1,0 +1,10 @@
+{
+  "idf.espIdfPath": "${workspaceFolder}/sdk/v6.1/esp-idf",
+  "idf.toolsPath": "${env:HOME}/.espressif/tools",
+  "idf.pythonBinPath": "${env:HOME}/.espressif/tools/python/v6.1/venv/bin/python",
+  "idf.flashType": "UART",
+  "C_Cpp.intelliSenseEngine": "default",
+  "clangd.arguments": [
+    "--compile-commands-dir=${workspaceFolder}/firmware/build"
+  ]
+}
