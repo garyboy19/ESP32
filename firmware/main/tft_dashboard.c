@@ -116,6 +116,54 @@ static tft_disp_t *g_disp;
 
 static void draw_splash(void);
 
+/*
+ * Orientation presets.
+ *
+ * MADCTL bit layout: MY=0x80 MX=0x40 MV=0x20 ML=0x10 BGR=0x08 MH=0x04
+ *
+ * The ILI9341 datasheet reference init for 240x320 portrait writes 0x48
+ * (MX|BGR). The MX bit is REQUIRED - leaving it clear mirrors the whole
+ * image horizontally. The splash colour bars are ordered RED->GREEN->BLUE,
+ * so a mirrored image is visible (red ends up on the right), but the text
+ * makes it obvious.
+ */
+#define ORIENT_COUNT 4
+static const struct {
+    bool mx;
+    bool my;
+    const char *label;
+} g_orientations[ORIENT_COUNT] = {
+    { true,  false, "MX"    },  /* datasheet portrait default (0x48) */
+    { false, false, "NONE"  },  /* mirrored - use if your panel needs it */
+    { false, true,  "MY"    },  /* vertical flip */
+    { true,  true,  "MXY"   },  /* 180 degrees */
+};
+static int g_orient = 0;
+
+/*
+ * Apply an orientation preset to the panel.
+ *
+ * MX is the horizontal mirror bit and it is REQUIRED for portrait mode:
+ * the datasheet reference init writes MADCTL = 0x48 (MX|BGR). Clearing it
+ * mirrors the whole image horizontally - the splash colour bars are ordered
+ * RED->GREEN->BLUE so red ends up on the right, and text reads backwards.
+ *
+ * The MV bit (swap_xy) selects landscape; the frame buffer dimensions are
+ * swapped accordingly (see FB_WIDTH/FB_HEIGHT).
+ */
+static void apply_orientation(int idx)
+{
+    idx = ((idx % ORIENT_COUNT) + ORIENT_COUNT) % ORIENT_COUNT;
+    g_orient = idx;
+    ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(g_panel, false));
+    ESP_ERROR_CHECK(esp_lcd_panel_mirror(g_panel,
+                                         g_orientations[idx].mx,
+                                         g_orientations[idx].my));
+    ESP_LOGI(TAG, "orientation %d: MADCTL mx=%d my=%d (%s)", idx,
+             g_orientations[idx].mx, g_orientations[idx].my,
+             g_orientations[idx].label);
+}
+
 static void backlight_on(void)
 {
 #if TFT_PIN_BACKLIGHT >= 0
@@ -198,22 +246,8 @@ static void tft_bringup(void)
     ESP_ERROR_CHECK(esp_lcd_panel_reset(g_panel));
     ESP_ERROR_CHECK(esp_lcd_panel_init(g_panel));
 
-    /* rotation */
-    switch (CONFIG_TFT_ROTATION) {
-    case 90:
-        ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(g_panel, true));
-        ESP_ERROR_CHECK(esp_lcd_panel_mirror(g_panel, false, true));
-        break;
-    case 180:
-        ESP_ERROR_CHECK(esp_lcd_panel_mirror(g_panel, true, true));
-        break;
-    case 270:
-        ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(g_panel, true));
-        ESP_ERROR_CHECK(esp_lcd_panel_mirror(g_panel, true, false));
-        break;
-    default:
-        break;
-    }
+    /* orientation: the MX bit is mandatory for portrait mode */
+    apply_orientation(0);
 
     ESP_ERROR_CHECK(esp_lcd_panel_set_brightness(g_panel, 255));
     backlight_on();
@@ -259,6 +293,14 @@ static void draw_splash(void)
 
     tft_draw_text(g_disp, 8, 100, "ILI9341 240x320", TFT_COLOR_WHITE, TFT_FONT_SMALL, 1);
     tft_draw_text(g_disp, 8, 116, "SPI2 40MHz", TFT_COLOR_LIGHTGRAY, TFT_FONT_SMALL, 1);
+
+    /* Asymmetric marker: a triangle on the left and a square on the right.
+     * If these appear swapped, the screen is mirrored horizontally. */
+    for (int r = 0; r < 14; r++) {
+        int half = 7 - r;
+        tft_fill_rect(g_disp, 12 + half, 132 + r, half * 2, 1, TFT_COLOR_WHITE);
+    }
+    tft_fill_rect(g_disp, FB_WIDTH - 26, 132, 14, 14, TFT_COLOR_WHITE);
 
     tft_draw_text_center(g_disp, 0, 150, FB_WIDTH, 40, "STARTING...", TFT_COLOR_YELLOW,
                          TFT_FONT_MEDIUM, 1);
@@ -441,6 +483,36 @@ static void telemetry_task(void *arg)
     }
 }
 
+/* ---------------- BOOT key: cycle screen orientation ---------------- */
+#define BOOT_GPIO GPIO_NUM_0
+
+static void boot_key_task(void *arg)
+{
+    gpio_config_t boot = {
+        .pin_bit_mask = 1ULL << BOOT_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&boot));
+
+    int last = gpio_get_level(BOOT_GPIO);
+    while (1) {
+        int lvl = gpio_get_level(BOOT_GPIO);
+        if (last == 1 && lvl == 0) {
+            /* falling edge: button just pressed */
+            vTaskDelay(pdMS_TO_TICKS(50));
+            if (gpio_get_level(BOOT_GPIO) == 0) {
+                apply_orientation(g_orient + 1);
+                render_dashboard();
+            }
+        }
+        last = lvl;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
 /* ---------------- dashboard task ---------------- */
 static void dashboard_task(void *arg)
 {
@@ -475,6 +547,7 @@ void app_main(void)
 
     xTaskCreatePinnedToCore(telemetry_task, "telemetry", 4096, NULL, 4, NULL, 0);
     xTaskCreatePinnedToCore(dashboard_task, "dashboard", 6144, NULL, 3, NULL, 1);
+    xTaskCreatePinnedToCore(boot_key_task, "bootkey", 2560, NULL, 2, NULL, 0);
 
     ESP_LOGI(TAG, "dashboard started");
 }
