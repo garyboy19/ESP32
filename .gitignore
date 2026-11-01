@@ -10,3 +10,4 @@ firmware/dependencies.lock
 
 __pycache__/
 *.pyc
+firmware/.cache/

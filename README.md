@@ -9,6 +9,8 @@
 | `sdk/v6.1/esp-idf` | ESP-IDF 源码 |
 | `export.sh/` | 环境激活脚本 |
 | `firmware/` | ESP32 开发板自检与遥测固件 |
+| `firmware/components/ili9341/` | ILI9341 TFT 驱动 + 绘图层组件 |
+| `firmware/TFT_WIRING.md` | TFT 接线说明与排错指南 |
 | `gui/board_monitor.py` | 桌面实时监控界面 |
 | `activate.sh` | 一键激活当前终端 |
 
@@ -50,6 +52,31 @@ python3 gui/board_monitor.py
 - **堆健康度告警**：窗口内最低堆相对峰值下滑超过 10% 即提示"疑似泄漏"
 - **串口自动重连**：拔线或设备异常断开后按 1→5s 退避自动重连，最多重试 10 次；手动断开则不再自动重连
 - **链路状态提示**：灰=未连接、橙=已连接但遥测中断 >3s、青=实时接收中
+
+## TFT 仪表盘（ILI9341 显示屏）
+
+固件支持两种模式，通过 `firmware/main/Kconfig` 的 choice 切换：
+
+| 模式 | 配置项 | 说明 |
+| --- | --- | --- |
+| 板卡自检 | `CONFIG_FIRMWARE_BOARD_TEST=y` | 只通过串口输出遥测 |
+| TFT 仪表盘 | `CONFIG_FIRMWARE_TFT_DASHBOARD=y` | 驱动 ILI9341 屏显示遥测，串口同时输出 |
+
+TFT 模式启动后屏幕显示开机自检画面（含红绿蓝彩条，用于验证颜色通道），随后刷新仪表盘：
+标题栏、四张数据卡（运行时间 / 可用堆 / 最低堆 / Wi-Fi AP 数）、堆内存趋势图、底部 RSSI 与修订号。
+
+### 组件构成
+
+| 文件 | 说明 |
+| --- | --- |
+| `components/ili9341/esp_lcd_panel_ili9341.c` | ILI9341 控制器驱动，实现 `esp_lcd_panel` 标准接口 |
+| `components/ili9341/tft_disp.c` | RGB565 绘图层：矩形 / 线条 / 文字 / 图表 / 分块刷屏 |
+| `components/ili9341/include/font6x8.h` | 6×8 ASCII 点阵字体 |
+| `components/ili9341/include/font11x16.h` | 11×16 ASCII 点阵字体 |
+| `main/tft_dashboard.c` | 仪表盘主程序，复用板卡遥测数据 |
+| `tools/gen_font.py` | 用 Pillow 重新生成点阵字体 |
+
+接线方式、常见花屏/黑屏排查见 **[firmware/TFT_WIRING.md](firmware/TFT_WIRING.md)**。
 
 ## 版本控制
 

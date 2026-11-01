@@ -1,0 +1,72 @@
+menu "ESP32 Project Configuration"
+
+    choice FIRMWARE_TARGET
+        prompt "Firmware target"
+        default FIRMWARE_BOARD_TEST
+
+        config FIRMWARE_BOARD_TEST
+            bool "Board test (serial telemetry only)"
+        config FIRMWARE_TFT_DASHBOARD
+            bool "TFT dashboard (ILI9341 display)"
+    endchoice
+
+endmenu
+
+menu "ILI9341 TFT Display"
+
+    config TFT_WIDTH
+        int "Frame buffer width (pixels)"
+        default 240
+        range 120 480
+
+    config TFT_HEIGHT
+        int "Frame buffer height (pixels)"
+        default 320
+        range 120 480
+
+    config TFT_SPI_HOST
+        int "SPI host (1 = SPI2, 2 = SPI3)"
+        default 1
+        range 1 3
+
+    config TFT_PIN_SCLK
+        int "GPIO for SCLK"
+        default 18
+
+    config TFT_PIN_MOSI
+        int "GPIO for MOSI"
+        default 23
+
+    config TFT_PIN_CS
+        int "GPIO for CS"
+        default 5
+
+    config TFT_PIN_DC
+        int "GPIO for DC (data/command)"
+        default 21
+
+    config TFT_PIN_RST
+        int "GPIO for RST (reset)"
+        default 22
+
+    config TFT_PIN_BACKLIGHT
+        int "GPIO for backlight (-1 to disable)"
+        default 4
+
+    config TFT_PCLK_HZ
+        int "SPI pixel clock (Hz)"
+        default 40000000
+
+    config TFT_ROTATION
+        int "Rotation (0/90/180/270)"
+        default 0
+
+    config TFT_INVERT_COLOR
+        bool "Invert colors"
+        default n
+
+    config TFT_BGR
+        bool "BGR color order"
+        default n
+
+endmenu
