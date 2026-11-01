@@ -36,10 +36,18 @@ extern "C" {
 #define TFT_COLOR_LIGHTGRAY  0xC618
 
 typedef enum {
-    TFT_FONT_SMALL = 0,   /*!< 6x8  */
+    TFT_FONT_SMALL = 0,   /*!< 6x8   */
     TFT_FONT_MEDIUM,      /*!< 11x16 */
+    TFT_FONT_LARGE,       /*!< 9x13  - one step below MEDIUM, more legible
+                               than SMALL on a 2.8" panel */
     TFT_FONT_COUNT,
 } tft_font_t;
+
+/*
+ * The CJK font is a separate, variable-width font: Chinese characters are
+ * 16 px wide, ASCII is 8 px. It cannot be mixed into tft_font_t because the
+ * advance width depends on the character, so it gets its own API.
+ */
 
 typedef struct tft_disp tft_disp_t;
 
@@ -104,6 +112,40 @@ void tft_draw_text_center(tft_disp_t *disp, int x, int y, int w, int h, const ch
 
 /** @brief Width in pixels of a string in the given font/scale */
 int tft_text_width(const char *text, tft_font_t font, int scale);
+
+/**
+ * @brief Draw UTF-8 text using the CJK font (16 px cells, 8 px ASCII)
+ *
+ * Chinese characters are drawn full width (16 px), ASCII half width (8 px),
+ * so mixed Chinese/English lines up correctly.
+ *
+ * @param[in] scale  Integer magnification factor (1 = native size)
+ * @return Width in pixels the string would occupy
+ */
+int tft_draw_text_cjk(tft_disp_t *disp, int x, int y, const char *text, uint16_t color,
+                      int scale);
+
+/**
+ * @brief Draw UTF-8 text centred horizontally inside a rectangle
+ */
+void tft_draw_text_cjk_center(tft_disp_t *disp, int x, int y, int w, int h,
+                              const char *text, uint16_t color, int scale);
+
+/**
+ * @brief Width in pixels of a UTF-8 string in the CJK font
+ */
+int tft_text_width_cjk(const char *text, int scale);
+
+/**
+ * @brief Clip a UTF-8 string so that it fits into `max_width` pixels
+ *
+ * Writes at most `dst_size - 1` bytes plus a NUL. When the text does not
+ * fit, the last complete character is replaced by a horizontal ellipsis
+ * ("...") if there is room for it.
+ *
+ * @return true when the whole string fitted
+ */
+bool tft_clip_text_cjk(char *dst, size_t dst_size, const char *text, int max_width);
 
 /**
  * @brief Draw a polyline chart

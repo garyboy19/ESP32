@@ -23,7 +23,10 @@
 #include "esp_lcd_panel_ops.h"
 #include "tft_disp.h"
 #include "font6x8.h"
+#include "font9x13.h"
 #include "font11x16.h"
+#include "font_cjk16_cp.h"
+#include "tft_cjk.h"
 
 static const char *TAG = "tft_disp";
 
@@ -47,6 +50,15 @@ static const uint8_t *font_medium_data(uint8_t code, uint8_t *w, uint8_t *h, uin
     }
     *w = font11x16_W; *h = font11x16_H; *bpr = font11x16_BPR;
     return font11x16[code - font11x16_FIRST];
+}
+
+static const uint8_t *font_large_data(uint8_t code, uint8_t *w, uint8_t *h, uint8_t *bpr)
+{
+    if (code < font9x13_FIRST || code > font9x13_LAST) {
+        code = '?';
+    }
+    *w = font9x13_W; *h = font9x13_H; *bpr = font9x13_BPR;
+    return font9x13[code - font9x13_FIRST];
 }
 
 struct tft_disp {
@@ -291,6 +303,9 @@ static const uint8_t *glyph_for(tft_font_t font, char ch, uint8_t *w, uint8_t *h
     if (font == TFT_FONT_SMALL) {
         return font_small_data(code, w, h, bpr);
     }
+    if (font == TFT_FONT_LARGE) {
+        return font_large_data(code, w, h, bpr);
+    }
     return font_medium_data(code, w, h, bpr);
 }
 
@@ -362,6 +377,216 @@ int tft_draw_text_bg(tft_disp_t *disp, int x, int y, const char *text, uint16_t 
     int text_w = (int)strlen(text) * w * scale;
     tft_fill_rect(disp, x - 2, y - 1, text_w + 4, h * scale + 2, bg);
     return tft_draw_text(disp, x, y, text, color, font, scale);
+}
+
+/* ------------------------------------------------------------------ */
+/* CJK text rendering                                                 */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Draw one glyph from the 16x16 CJK cell.
+ *
+ * Chinese characters fill the whole cell (16 px wide).
+ * ASCII glyphs are stored as a 9x13 bitmap at the bottom-left of the cell
+ * so that they share the baseline with the Chinese glyphs, and they advance
+ * only 9 px.
+ */
+/* Glyph bitmap for '?' - used as the placeholder for characters that are
+ * not in the CJK font (a hollow box reads like a rendering fault). */
+static const uint8_t *ascii_question_mark(void)
+{
+    const uint8_t *g = NULL;
+    if (!tft_cjk_glyph('?', &g)) {
+        return NULL;
+    }
+    return g;
+}
+
+static void draw_cjk_cell(tft_disp_t *disp, int x, int y, const uint8_t *data,
+                          bool narrow, uint16_t color, int scale)
+{
+    if (!data) {
+        return;
+    }
+    /* ASCII: 9x13 bitmap at the bottom-left of the cell (shares the baseline
+     * with the Chinese glyphs). Chinese: the full 16x16 cell. */
+    int src_w = narrow ? FONT_CJK16_ASCII_W : TFT_CJK_CELL_W;
+    int src_h = narrow ? FONT_CJK16_ASCII_H : TFT_CJK_CELL_H;
+    int y_off = narrow ? (TFT_CJK_CELL_H - FONT_CJK16_ASCII_H) : 0;
+
+    for (int gy = 0; gy < src_h; gy++) {
+        for (int gx = 0; gx < src_w; gx++) {
+            /* The ASCII glyph is stored at cell rows y_off..y_off+src_h-1. */
+            uint8_t byte = data[(y_off + gy) * TFT_CJK_BPR + gx / 8];
+            if (!(byte & (1 << (7 - (gx % 8))))) {
+                continue;
+            }
+            int dy = y + y_off + gy;
+            if (scale == 1) {
+                fb_set(disp, x + gx, dy, color);
+            } else {
+                tft_fill_rect(disp, x + gx * scale, dy * scale, scale, scale, color);
+            }
+        }
+    }
+}
+
+int tft_text_width_cjk(const char *text, int scale)
+{
+    if (!text) {
+        return 0;
+    }
+    if (scale < 1) {
+        scale = 1;
+    }
+    return tft_cjk_text_width(text) * scale;
+}
+
+int tft_draw_text_cjk(tft_disp_t *disp, int x, int y, const char *text, uint16_t color,
+                      int scale)
+{
+    if (!disp || !text) {
+        return 0;
+    }
+    if (scale < 1) {
+        scale = 1;
+    }
+    int cursor = x;
+    while (*text) {
+        uint32_t cp = 0;
+        int len = 0;
+        if (!tft_utf8_decode(text, &cp, &len)) {
+            text++;
+            cursor += TFT_CJK_HALF_W * scale;
+            continue;
+        }
+        const uint8_t *data = NULL;
+        if (tft_cjk_glyph(cp, &data)) {
+            bool narrow = (cp < 0x80);
+            int cell_w = narrow ? TFT_CJK_HALF_W : TFT_CJK_CELL_W;
+            draw_cjk_cell(disp, cursor, y, data, narrow, color, scale);
+            cursor += cell_w * scale;
+        } else {
+            /* Character not in the font: draw a '?' placeholder. A hollow
+             * box was tried first but it is indistinguishable from a real
+             * glyph outline and reads as a rendering fault. */
+            draw_cjk_cell(disp, cursor, y, ascii_question_mark(), true, color, scale);
+            cursor += TFT_CJK_HALF_W * scale;
+        }
+        text += len;
+    }
+    return cursor - x;
+}
+
+void tft_draw_text_cjk_center(tft_disp_t *disp, int x, int y, int w, int h,
+                              const char *text, uint16_t color, int scale)
+{
+    if (!disp || !text) {
+        return;
+    }
+    if (scale < 1) {
+        scale = 1;
+    }
+    int tw = tft_cjk_text_width(text) * scale;
+    int tx = x + (w - tw) / 2;
+    if (tx < x) {
+        tx = x;
+    }
+    int ty = y + (h - TFT_CJK_CELL_H * scale) / 2;
+    if (ty < y) {
+        ty = y;
+    }
+    tft_draw_text_cjk(disp, tx, ty, text, color, scale);
+}
+
+bool tft_clip_text_cjk(char *dst, size_t dst_size, const char *text, int max_width)
+{
+    if (!dst || dst_size == 0) {
+        return false;
+    }
+    dst[0] = '\0';
+    if (!text) {
+        return true;
+    }
+
+    int width = 0;
+    const char *p = text;
+    const char *last_good = text;      /* start of the last complete char */
+
+    while (*p) {
+        uint32_t cp = 0;
+        int len = 0;
+        if (!tft_utf8_decode(p, &cp, &len)) {
+            p++;
+            continue;
+        }
+        int cw = (cp < 0x80) ? TFT_CJK_HALF_W : TFT_CJK_CELL_W;
+        if (width + cw > max_width) {
+            break;
+        }
+        width += cw;
+        p += len;
+        last_good = p;
+    }
+
+    if (*p == '\0') {
+        /* everything fitted */
+        size_t n = strlen(text);
+        if (n >= dst_size) {
+            n = dst_size - 1;
+        }
+        memcpy(dst, text, n);
+        dst[n] = '\0';
+        return true;
+    }
+
+    /* it did not fit: try to end with an ellipsis */
+    const char *ell = "...";
+    int ell_w = 3 * TFT_CJK_HALF_W;
+    if (max_width - ell_w >= 0) {
+        int keep = max_width - ell_w;
+        /* back off to the last character that still fits in `keep` */
+        int w = 0;
+        const char *q = text;
+        const char *cut = text;
+        while (*q) {
+            uint32_t cp = 0;
+            int len = 0;
+            if (!tft_utf8_decode(q, &cp, &len)) {
+                q++;
+                continue;
+            }
+            int cw = (cp < 0x80) ? TFT_CJK_HALF_W : TFT_CJK_CELL_W;
+            if (w + cw > keep) {
+                break;
+            }
+            w += cw;
+            q += len;
+            cut = q;
+        }
+        size_t n = (size_t)(cut - text);
+        if (n >= dst_size) {
+            n = dst_size - 1;
+        }
+        memcpy(dst, text, n);
+        dst[n] = '\0';
+        /* append the ellipsis if there is room */
+        size_t el = strlen(ell);
+        if (n + el < dst_size) {
+            memcpy(dst + n, ell, el);
+            dst[n + el] = '\0';
+        }
+        return false;
+    }
+
+    /* not even an ellipsis fits: just truncate */
+    size_t n = (size_t)(last_good - text);
+    if (n >= dst_size) {
+        n = dst_size - 1;
+    }
+    memcpy(dst, text, n);
+    dst[n] = '\0';
+    return false;
 }
 
 void tft_draw_text_center(tft_disp_t *disp, int x, int y, int w, int h, const char *text,

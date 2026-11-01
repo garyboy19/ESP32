@@ -31,6 +31,7 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_ili9341.h"
 #include "tft_disp.h"
+#include "tft_cjk.h"
 #include "wifi_page.h"
 
 static const char *TAG = "tft_dash";
@@ -84,6 +85,24 @@ static const char *wifi_auth_label(uint8_t auth)
     case WIFI_AUTH_WAPI_PSK:              return "WAPI";
     case WIFI_AUTH_ENTERPRISE:            return "EAP";
     default:                              return "SEC";
+    }
+}
+
+/* Security label in Chinese, for the Wi-Fi list column. */
+static const char *wifi_auth_label_cjk(uint8_t auth)
+{
+    switch (auth) {
+    case WIFI_AUTH_OPEN:                  return "开放";
+    case WIFI_AUTH_WEP:                   return "WEP";
+    case WIFI_AUTH_WPA_PSK:               return "WPA";
+    case WIFI_AUTH_WPA2_PSK:              return "WPA2";
+    case WIFI_AUTH_WPA_WPA2_PSK:          return "WPA2";
+    case WIFI_AUTH_WPA3_PSK:              return "WPA3";
+    case WIFI_AUTH_WPA2_WPA3_PSK:         return "WPA3";
+    case WIFI_AUTH_OWE:                   return "OWE";
+    case WIFI_AUTH_WAPI_PSK:              return "WAPI";
+    case WIFI_AUTH_ENTERPRISE:            return "EAP";
+    default:                              return "加密";
     }
 }
 
@@ -172,6 +191,23 @@ static tft_disp_t *g_disp;
 static void draw_splash(void);
 static void render_dashboard(void);
 static void render_wifi_page(void);
+static void dump_page_text(void);
+static void hist_push(int v_free, int v_min);
+static void wifi_reply(const char *fmt, ...);
+static void wifi_reply_list(void);
+static void wifi_do_connect(const char *ssid, const char *password);
+static void wifi_do_disconnect(void);
+
+/*
+ * Rendering mutex.
+ *
+ * The dashboard task refreshes once per second while the BOOT key task may
+ * redraw at any moment (page switch / orientation change). Both write the
+ * same frame buffer and push it over SPI, so without this lock the two tasks
+ * interleave their drawing and flush cycles - that shows up as garbage on
+ * the panel.
+ */
+static SemaphoreHandle_t g_render_mutex;
 
 /*
  * Orientation presets.
@@ -220,6 +256,440 @@ static void apply_orientation(int idx)
              g_orientations[idx].mx, g_orientations[idx].my,
              g_orientations[idx].label);
 }
+
+/*
+ * Parse and run one command line. Returns true if the line was a command.
+ */
+static bool handle_command(const char *line)
+{
+    if (strncmp(line, "@CMD ", 5) != 0) {
+        return false;
+    }
+    const char *args = line + 5;
+
+    if (strncmp(args, "SCAN", 4) == 0) {
+        esp_err_t err = esp_wifi_scan_start(NULL, true);
+        wifi_page_set_scanning(err == ESP_OK);
+        wifi_reply("{\"type\":\"scan\",\"err\":%d}", (int)err);
+        return true;
+    }
+    if (strncmp(args, "LIST", 4) == 0) {
+        wifi_reply_list();
+        return true;
+    }
+    if (strncmp(args, "PAGE", 4) == 0) {
+        /* Debug: dump the exact text the Wi-Fi page renders, plus the
+         * code points that are missing from the CJK font (drawn as '?'). */
+        dump_page_text();
+        return true;
+    }
+    if (strncmp(args, "DISCONNECT", 10) == 0) {
+        wifi_do_disconnect();
+        return true;
+    }
+    if (strncmp(args, "CONNECT ", 8) == 0) {
+        args += 8;
+        char ssid[33];
+        char password[65];
+        password[0] = '\0';
+
+        /* Both the SSID and the password may be quoted so that names with
+         * spaces survive the round trip. Strip the quotes and unescape
+         * backslash-escaped characters. */
+        const char *p = args;
+        char *out = ssid;
+        size_t out_len = 0;
+        bool in_quotes = false;
+
+        /* Read the SSID. A quoted token may contain spaces; an unquoted one
+         * ends at the first space. */
+        while (*p && out_len < sizeof(ssid) - 1) {
+            if (*p == '"') {
+                in_quotes = !in_quotes;
+                p++;
+                continue;
+            }
+            if (!in_quotes && *p == ' ') {
+                break;
+            }
+            if (*p == '\\' && p[1] != '\0') {
+                p++;
+            }
+            *out++ = *p++;
+            out_len++;
+        }
+        *out = '\0';
+
+        /* The password is the rest of the line (may also be quoted). */
+        while (*p == ' ') {
+            p++;
+        }
+        out = password;
+        out_len = 0;
+        in_quotes = false;
+        while (*p && out_len < sizeof(password) - 1) {
+            if (*p == '"') {
+                in_quotes = !in_quotes;
+                p++;
+                continue;
+            }
+            if (*p == '\\' && p[1] != '\0') {
+                p++;
+            }
+            *out++ = *p++;
+            out_len++;
+        }
+        *out = '\0';
+
+        wifi_do_connect(ssid, password[0] ? password : NULL);
+        return true;
+    }
+
+    wifi_reply("{\"type\":\"error\",\"msg\":\"unknown command\"}");
+    return true;
+}
+
+/*
+ * Serial command task.
+ *
+ * The project does not link esp_console, so no UART driver is installed yet.
+ * Installing one with tx_buffer_size = 0 keeps stdout working (writes go
+ * straight to the FIFO) while giving us an interrupt driven RX buffer.
+ */
+static void serial_cmd_task(void *arg)
+{
+    static char line[160];
+    int len = 0;
+
+    const uart_port_t port = UART_NUM_0;
+    if (!uart_is_driver_installed(port)) {
+        /* rx_buffer_size must be > the 128 byte HW FIFO, tx stays at 0 so
+         * that printf()/stdout keeps using the direct FIFO path. */
+        esp_err_t err = uart_driver_install(port, 1024, 0, 0, NULL, 0);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "uart driver install failed: %s", esp_err_to_name(err));
+            return;
+        }
+        ESP_LOGI(TAG, "uart rx driver installed");
+    }
+
+    while (1) {
+        uint8_t c;
+        int n = uart_read_bytes(port, &c, 1, pdMS_TO_TICKS(50));
+        if (n <= 0) {
+            continue;
+        }
+        if (c == '\r' || c == '\n') {
+            if (len > 0) {
+                line[len] = '\0';
+                handle_command(line);
+                len = 0;
+            }
+            continue;
+        }
+        if (c == 8 || c == 127) { /* backspace */
+            if (len > 0) {
+                len--;
+            }
+            continue;
+        }
+        if (len < (int)sizeof(line) - 1) {
+            line[len++] = (char)c;
+        }
+    }
+}
+
+/* ---------------- Wi-Fi list page ---------------- */
+#define PAGE_DASHBOARD 0
+#define PAGE_WIFI     1
+
+static int g_page = PAGE_DASHBOARD;
+
+/*
+ * Column layout for the Wi-Fi list, in pixels.
+ *
+ * The list uses the CJK font: Chinese glyphs are 16 px wide, ASCII 9 px.
+ * The screen is 240 px wide, so the columns are laid out like this:
+ *
+ *   marker x=2    one ASCII glyph ( 9 px)  -> ends at  11
+ *   SSID   x=11   mixed, up to 100 px     -> ends at 111
+ *   SEC    x=116  "WPA2" (4 x 9 = 36 px)  -> ends at 152
+ *   SIG    x=158  4 bars        ( 16 px)  -> ends at 174
+ *   CH     x=200  3 glyphs      ( 27 px)  -> ends at 227
+ */
+#define WIFI_COL_SSID    2
+#define WIFI_COL_SEC     116
+#define WIFI_COL_SIG     158
+#define WIFI_COL_CH      200
+#define WIFI_SSID_X      11
+#define WIFI_SSID_PX     100
+
+#define WIFI_ROW_H       18
+#define WIFI_LIST_TOP    92
+
+/* Draw a small signal-strength bar (4 segments) at (x, y), 13 px tall. */
+static void draw_signal_bars(int x, int y, int bars)
+{
+    for (int i = 0; i < 4; i++) {
+        int h = 4 + i * 3;
+        uint16_t color = (i < bars) ? TFT_COLOR_GREEN : TFT_COLOR_DARKGRAY;
+        tft_fill_rect(g_disp, x + i * 4, y + (13 - h), 3, h, color);
+    }
+}
+
+/*
+ * The Wi-Fi page lists the nearby networks that can be joined:
+ *   - SSID (clipped to the column)
+ *   - security type (开放 / WPA2 / ...)
+ *   - signal strength as bars
+ *   - channel
+ */
+static void render_wifi_page(void)
+{
+    wifi_page_state_t st;
+    wifi_page_get(&st);
+
+    char buf[64];
+    char ssid[40];
+
+    tft_clear(g_disp, TFT_COLOR_BLACK);
+
+    /* header */
+    tft_fill_rect(g_disp, 0, 0, FB_WIDTH, 32, TFT_COLOR_DARKGRAY);
+    tft_draw_text_cjk(g_disp, 4, 8, "Wi-Fi 网络列表", TFT_COLOR_CYAN, 1);
+    tft_draw_hline(g_disp, 0, 32, FB_WIDTH, TFT_COLOR_GRAY, 1);
+
+    /* status line: connection state */
+    if (st.connected) {
+        snprintf(buf, sizeof(buf), "已连接：%s", st.connected_ssid);
+        tft_draw_text_cjk(g_disp, 2, 36, buf, TFT_COLOR_GREEN, 1);
+        if (st.ip[0]) {
+            snprintf(buf, sizeof(buf), "IP %s", st.ip);
+            tft_draw_text_cjk(g_disp, 2, 54, buf, TFT_COLOR_YELLOW, 1);
+        }
+    } else {
+        snprintf(buf, sizeof(buf), "状态：%s", st.status);
+        tft_draw_text_cjk(g_disp, 2, 36, buf, TFT_COLOR_ORANGE, 1);
+    }
+
+    /* column headers */
+    tft_draw_text_cjk(g_disp, WIFI_COL_SSID, 74, "名称", TFT_COLOR_GRAY, 1);
+    tft_draw_text_cjk(g_disp, WIFI_COL_SEC, 74, "加密", TFT_COLOR_GRAY, 1);
+    tft_draw_text_cjk(g_disp, WIFI_COL_SIG, 74, "信号", TFT_COLOR_GRAY, 1);
+    tft_draw_text_cjk(g_disp, WIFI_COL_CH, 74, "信道", TFT_COLOR_GRAY, 1);
+    tft_draw_hline(g_disp, 0, 90, FB_WIDTH, TFT_COLOR_DARKGRAY, 1);
+
+    /* list rows */
+    int row_y = WIFI_LIST_TOP;
+    const int max_rows = (FB_HEIGHT - 44 - WIFI_LIST_TOP) / WIFI_ROW_H;
+    for (int i = 0; i < st.count && i < max_rows; i++) {
+        const wifi_page_ap_t *ap = &st.aps[i];
+
+        /* the connected network gets a marker in the margin */
+        bool is_current = st.connected && strcmp(ap->ssid, st.connected_ssid) == 0;
+
+        tft_clip_text_cjk(ssid, sizeof(ssid), ap->ssid, WIFI_SSID_PX);
+        if (is_current) {
+            tft_draw_text_cjk(g_disp, WIFI_COL_SSID, row_y, "*", TFT_COLOR_GREEN, 1);
+        }
+        tft_draw_text_cjk(g_disp, WIFI_SSID_X, row_y, ssid,
+                          is_current ? TFT_COLOR_GREEN : TFT_COLOR_WHITE, 1);
+
+        /* security */
+        tft_draw_text_cjk(g_disp, WIFI_COL_SEC, row_y, wifi_auth_label_cjk(ap->auth),
+                          ap->auth == WIFI_AUTH_OPEN ? TFT_COLOR_ORANGE : TFT_COLOR_LIGHTGRAY, 1);
+
+        /* signal bars */
+        draw_signal_bars(WIFI_COL_SIG, row_y, wifi_rssi_bars(ap->rssi));
+
+        /* channel */
+        snprintf(buf, sizeof(buf), "%d", ap->channel);
+        tft_draw_text_cjk(g_disp, WIFI_COL_CH, row_y, buf, TFT_COLOR_LIGHTGRAY, 1);
+
+        row_y += WIFI_ROW_H;
+    }
+
+    if (st.count == 0) {
+        tft_draw_text_cjk(g_disp, 4, WIFI_LIST_TOP + 4,
+                          st.scanning ? "正在扫描…" : "未发现网络",
+                          TFT_COLOR_GRAY, 1);
+    }
+
+    /* footer */
+    tft_draw_hline(g_disp, 0, FB_HEIGHT - 36, FB_WIDTH, TFT_COLOR_GRAY, 1);
+    snprintf(buf, sizeof(buf), "共发现 %d 个网络", st.total);
+    tft_draw_text_cjk(g_disp, 2, FB_HEIGHT - 32, buf, TFT_COLOR_CYAN, 1);
+    tft_draw_text_cjk(g_disp, 2, FB_HEIGHT - 16, "BOOT键：切换页面/方向",
+                      TFT_COLOR_LIGHTGRAY, 1);
+
+    ESP_ERROR_CHECK(tft_flush(g_disp));
+}
+
+/* ---------------- telemetry task ---------------- */
+static void telemetry_task(void *arg)
+{
+    TickType_t last_wifi_scan = 0;
+    while (1) {
+        board_info_t info = {
+            .uptime_s = (uint32_t)(esp_timer_get_time() / 1000000ULL),
+            .free_heap = esp_get_free_heap_size(),
+            .min_heap = esp_get_minimum_free_heap_size(),
+            .ap_count = g_wifi_ap_count,
+            .best_rssi = g_wifi_best_rssi,
+            .best_channel = g_wifi_best_channel,
+        };
+        esp_chip_info_t chip;
+        esp_chip_info(&chip);
+        snprintf(info.revision, sizeof(info.revision), "%d.%d",
+                 chip.revision / 100, chip.revision % 100);
+        uint8_t mac[6] = {0};
+        esp_read_mac(mac, ESP_MAC_WIFI_STA);
+        snprintf(info.mac, sizeof(info.mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+        xSemaphoreTake(g_info_mutex, portMAX_DELAY);
+        g_info = info;
+        xSemaphoreGive(g_info_mutex);
+
+        hist_push((int)info.free_heap, (int)info.min_heap);
+
+        /* serial telemetry: keep the format the PC GUI expects */
+        printf("@DATA {\"uptime_s\":%" PRIu32 ",\"free_heap\":%zu,\"min_heap\":%zu,"
+               "\"ap_count\":%d,\"best_rssi\":%d,\"best_channel\":%d,\"revision\":\"%s\"}\n",
+               info.uptime_s, info.free_heap, info.min_heap, info.ap_count,
+               info.best_rssi, info.best_channel, info.revision);
+        fflush(stdout);
+
+        /* periodic wifi rescan */
+        if (xTaskGetTickCount() - last_wifi_scan > pdMS_TO_TICKS(30000)) {
+            last_wifi_scan = xTaskGetTickCount();
+            if (esp_wifi_scan_start(NULL, true) == ESP_OK) {
+                wifi_page_set_scanning(true);
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
+/* ---------------- BOOT key: short press = page, long press = orientation ------ */
+#define BOOT_GPIO GPIO_NUM_0
+#define BOOT_LONG_PRESS_MS 1200
+
+static void render_current_page(void)
+{
+    /* Serialise all drawing: the dashboard task and the BOOT key task both
+     * render, and concurrent frame-buffer writes produce garbage on the
+     * panel. */
+    if (g_render_mutex) {
+        xSemaphoreTake(g_render_mutex, portMAX_DELAY);
+    }
+    if (g_page == PAGE_WIFI) {
+        render_wifi_page();
+    } else {
+        render_dashboard();
+    }
+    if (g_render_mutex) {
+        xSemaphoreGive(g_render_mutex);
+    }
+}
+
+/*
+ * Debug helper for @CMD PAGE.
+ *
+ * Prints the exact text the Wi-Fi page draws, one line per row, so the
+ * host can compare it against what is on the panel. Characters that are
+ * not in the CJK font are drawn as '?' by the renderer; they are marked
+ * here with a trailing note so a missing glyph is visible in the log
+ * instead of only on the screen.
+ */
+static void page_report_line(const char *label, const char *text)
+{
+    char missing[64];
+    size_t miss_len = 0;
+    missing[0] = '\0';
+    const char *p = text;
+    while (*p && miss_len + 8 < sizeof(missing)) {
+        uint32_t cp = 0;
+        int len = 0;
+        if (!tft_utf8_decode(p, &cp, &len)) {
+            p++;
+            continue;
+        }
+        if (cp >= 0x80) {
+            const uint8_t *g = NULL;
+            if (!tft_cjk_glyph(cp, &g)) {
+                /* record the code point as UTF-8 */
+                if (cp < 0x800) {
+                    missing[miss_len++] = (char)(0xC0 | (cp >> 6));
+                    missing[miss_len++] = (char)(0x80 | (cp & 0x3F));
+                } else {
+                    missing[miss_len++] = (char)(0xE0 | (cp >> 12));
+                    missing[miss_len++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                    missing[miss_len++] = (char)(0x80 | (cp & 0x3F));
+                }
+                missing[miss_len] = '\0';
+            }
+        }
+        p += len;
+    }
+    /* Escape the missing-glyph code points so the reply is valid JSON
+     * even when they are multi-byte UTF-8. */
+    char miss_hex[256];
+    size_t hx = 0;
+    for (size_t i = 0; i < miss_len && hx + 8 < sizeof(miss_hex); i++) {
+        hx += (size_t)snprintf(miss_hex + hx, sizeof(miss_hex) - hx, "%02X",
+                               (unsigned char)missing[i]);
+    }
+    miss_hex[hx] = '\0';
+
+    printf("@PAGE {\"row\":\"%s\",\"text\":\"%s\",\"missing\":\"%s\"}\n",
+           label, text, miss_hex);
+    fflush(stdout);
+}
+
+static void dump_page_text(void)
+{
+    wifi_page_state_t st;
+    wifi_page_get(&st);
+
+    char buf[64];
+    char ssid[40];
+
+    page_report_line("title", "Wi-Fi 网络列表");
+    if (st.connected) {
+        snprintf(buf, sizeof(buf), "已连接：%s", st.connected_ssid);
+        page_report_line("status", buf);
+        if (st.ip[0]) {
+            snprintf(buf, sizeof(buf), "IP %s", st.ip);
+            page_report_line("ip", buf);
+        }
+    } else {
+        snprintf(buf, sizeof(buf), "状态：%s", st.status);
+        page_report_line("status", buf);
+    }
+    page_report_line("hdr_ssid", "名称");
+    page_report_line("hdr_sec", "加密");
+    page_report_line("hdr_sig", "信号");
+    page_report_line("hdr_ch", "信道");
+
+    int row = 0;
+    for (int i = 0; i < st.count; i++) {
+        const wifi_page_ap_t *ap = &st.aps[i];
+        tft_clip_text_cjk(ssid, sizeof(ssid), ap->ssid, WIFI_SSID_PX);
+        char line[128];
+        snprintf(line, sizeof(line), "%s | %s | ch%d", ssid,
+                 wifi_auth_label_cjk(ap->auth), ap->channel);
+        char label[16];
+        snprintf(label, sizeof(label), "row%d", row++);
+        page_report_line(label, line);
+    }
+
+    snprintf(buf, sizeof(buf), "共发现 %d 个网络", st.total);
+    page_report_line("footer", buf);
+    page_report_line("hint", "BOOT键：切换页面/方向");
+}
+
 
 static void backlight_on(void)
 {
@@ -390,7 +860,7 @@ static void hist_push(int v_free, int v_min)
 static void draw_header(void)
 {
     tft_fill_rect(g_disp, 0, 0, FB_WIDTH, 34, TFT_COLOR_DARKGRAY);
-    tft_draw_text(g_disp, 6, 5, "ESP32 BOARD MONITOR", TFT_COLOR_CYAN, TFT_FONT_MEDIUM, 1);
+    tft_draw_text_cjk(g_disp, 6, 9, "ESP32 开发板监控", TFT_COLOR_CYAN, 1);
     tft_draw_hline(g_disp, 0, 34, FB_WIDTH, TFT_COLOR_GRAY, 1);
 }
 
@@ -398,8 +868,8 @@ static void draw_stat_box(int x, int y, int w, int h, const char *label, const c
                           uint16_t value_color)
 {
     tft_draw_rect(g_disp, x, y, w, h, TFT_COLOR_GRAY, 1);
-    tft_draw_text(g_disp, x + 5, y + 4, label, TFT_COLOR_LIGHTGRAY, TFT_FONT_SMALL, 1);
-    tft_draw_text(g_disp, x + 5, y + 15, value, value_color, TFT_FONT_MEDIUM, 1);
+    tft_draw_text_cjk(g_disp, x + 5, y + 3, label, TFT_COLOR_LIGHTGRAY, 1);
+    tft_draw_text(g_disp, x + 5, y + 19, value, value_color, TFT_FONT_MEDIUM, 1);
 }
 
 static void render_dashboard(void)
@@ -416,22 +886,21 @@ static void render_dashboard(void)
 
     /* stat cards */
     snprintf(buf, sizeof(buf), "%" PRIu32 "s", info.uptime_s);
-    draw_stat_box(4, 40, 108, 38, "UPTIME", buf, TFT_COLOR_WHITE);
+    draw_stat_box(4, 40, 108, 38, "运行时间", buf, TFT_COLOR_WHITE);
 
     snprintf(buf, sizeof(buf), "%zu KB", info.free_heap / 1024);
-    draw_stat_box(128, 40, 108, 38, "FREE HEAP", buf, TFT_COLOR_GREEN);
+    draw_stat_box(128, 40, 108, 38, "可用堆", buf, TFT_COLOR_GREEN);
 
     snprintf(buf, sizeof(buf), "%zu KB", info.min_heap / 1024);
-    draw_stat_box(4, 82, 108, 38, "MIN HEAP", buf, TFT_COLOR_ORANGE);
+    draw_stat_box(4, 82, 108, 38, "最低堆", buf, TFT_COLOR_ORANGE);
 
     snprintf(buf, sizeof(buf), "%d AP", info.ap_count);
-    draw_stat_box(128, 82, 108, 38, "WIFI AP", buf, TFT_COLOR_CYAN);
+    draw_stat_box(128, 82, 108, 38, "Wi-Fi 数量", buf, TFT_COLOR_CYAN);
 
     /* heap chart */
     const int chart_x = 4, chart_y = 128, chart_w = FB_WIDTH - 8, chart_h = 100;
     tft_draw_rect(g_disp, chart_x, chart_y, chart_w, chart_h, TFT_COLOR_GRAY, 1);
-    tft_draw_text(g_disp, chart_x + 4, chart_y - 10, "HEAP TREND", TFT_COLOR_LIGHTGRAY,
-                  TFT_FONT_SMALL, 1);
+    tft_draw_text_cjk(g_disp, chart_x + 4, chart_y - 12, "堆内存趋势", TFT_COLOR_LIGHTGRAY, 1);
 
     if (s_hist_count >= 2) {
         /* scale: dynamic, based on the current window */
@@ -464,17 +933,14 @@ static void render_dashboard(void)
         tft_draw_chart(g_disp, free_pts, s_hist_count, chart_x + 1, chart_y + 1,
                        chart_w - 2, chart_h - 2, TFT_COLOR_GREEN, false);
     } else {
-        tft_draw_text(g_disp, chart_x + 10, chart_y + 40, "collecting...", TFT_COLOR_GRAY,
-                      TFT_FONT_SMALL, 1);
+        tft_draw_text_cjk(g_disp, chart_x + 10, chart_y + 40, "正在采集…", TFT_COLOR_GRAY, 1);
     }
 
     /* legend */
     tft_fill_rect(g_disp, chart_x + 2, chart_y + chart_h - 12, 10, 3, TFT_COLOR_GREEN);
-    tft_draw_text(g_disp, chart_x + 16, chart_y + chart_h - 16, "FREE", TFT_COLOR_GREEN,
-                  TFT_FONT_SMALL, 1);
+    tft_draw_text_cjk(g_disp, chart_x + 16, chart_y + chart_h - 17, "可用", TFT_COLOR_GREEN, 1);
     tft_fill_rect(g_disp, chart_x + 60, chart_y + chart_h - 12, 10, 3, TFT_COLOR_ORANGE);
-    tft_draw_text(g_disp, chart_x + 74, chart_y + chart_h - 16, "MIN", TFT_COLOR_ORANGE,
-                  TFT_FONT_SMALL, 1);
+    tft_draw_text_cjk(g_disp, chart_x + 74, chart_y + chart_h - 17, "最低", TFT_COLOR_ORANGE, 1);
 
     /* bottom info */
     tft_draw_hline(g_disp, 0, FB_HEIGHT - 42, FB_WIDTH, TFT_COLOR_GRAY, 1);
@@ -616,305 +1082,7 @@ static void wifi_do_disconnect(void)
     wifi_reply("{\"type\":\"disconnected\",\"err\":%d}", (int)err);
 }
 
-/*
- * Parse and run one command line. Returns true if the line was a command.
- */
-static bool handle_command(const char *line)
-{
-    if (strncmp(line, "@CMD ", 5) != 0) {
-        return false;
-    }
-    const char *args = line + 5;
 
-    if (strncmp(args, "SCAN", 4) == 0) {
-        esp_err_t err = esp_wifi_scan_start(NULL, true);
-        wifi_page_set_scanning(err == ESP_OK);
-        wifi_reply("{\"type\":\"scan\",\"err\":%d}", (int)err);
-        return true;
-    }
-    if (strncmp(args, "LIST", 4) == 0) {
-        wifi_reply_list();
-        return true;
-    }
-    if (strncmp(args, "DISCONNECT", 10) == 0) {
-        wifi_do_disconnect();
-        return true;
-    }
-    if (strncmp(args, "CONNECT ", 8) == 0) {
-        args += 8;
-        char ssid[33];
-        char password[65];
-        password[0] = '\0';
-
-        /* Both the SSID and the password may be quoted so that names with
-         * spaces survive the round trip. Strip the quotes and unescape
-         * backslash-escaped characters. */
-        const char *p = args;
-        char *out = ssid;
-        size_t out_len = 0;
-        bool in_quotes = false;
-
-        /* Read the SSID. A quoted token may contain spaces; an unquoted one
-         * ends at the first space. */
-        while (*p && out_len < sizeof(ssid) - 1) {
-            if (*p == '"') {
-                in_quotes = !in_quotes;
-                p++;
-                continue;
-            }
-            if (!in_quotes && *p == ' ') {
-                break;
-            }
-            if (*p == '\\' && p[1] != '\0') {
-                p++;
-            }
-            *out++ = *p++;
-            out_len++;
-        }
-        *out = '\0';
-
-        /* The password is the rest of the line (may also be quoted). */
-        while (*p == ' ') {
-            p++;
-        }
-        out = password;
-        out_len = 0;
-        in_quotes = false;
-        while (*p && out_len < sizeof(password) - 1) {
-            if (*p == '"') {
-                in_quotes = !in_quotes;
-                p++;
-                continue;
-            }
-            if (*p == '\\' && p[1] != '\0') {
-                p++;
-            }
-            *out++ = *p++;
-            out_len++;
-        }
-        *out = '\0';
-
-        wifi_do_connect(ssid, password[0] ? password : NULL);
-        return true;
-    }
-
-    wifi_reply("{\"type\":\"error\",\"msg\":\"unknown command\"}");
-    return true;
-}
-
-/*
- * Serial command task.
- *
- * The project does not link esp_console, so no UART driver is installed yet.
- * Installing one with tx_buffer_size = 0 keeps stdout working (writes go
- * straight to the FIFO) while giving us an interrupt driven RX buffer.
- */
-static void serial_cmd_task(void *arg)
-{
-    static char line[160];
-    int len = 0;
-
-    const uart_port_t port = UART_NUM_0;
-    if (!uart_is_driver_installed(port)) {
-        /* rx_buffer_size must be > the 128 byte HW FIFO, tx stays at 0 so
-         * that printf()/stdout keeps using the direct FIFO path. */
-        esp_err_t err = uart_driver_install(port, 1024, 0, 0, NULL, 0);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "uart driver install failed: %s", esp_err_to_name(err));
-            return;
-        }
-        ESP_LOGI(TAG, "uart rx driver installed");
-    }
-
-    while (1) {
-        uint8_t c;
-        int n = uart_read_bytes(port, &c, 1, pdMS_TO_TICKS(50));
-        if (n <= 0) {
-            continue;
-        }
-        if (c == '\r' || c == '\n') {
-            if (len > 0) {
-                line[len] = '\0';
-                handle_command(line);
-                len = 0;
-            }
-            continue;
-        }
-        if (c == 8 || c == 127) { /* backspace */
-            if (len > 0) {
-                len--;
-            }
-            continue;
-        }
-        if (len < (int)sizeof(line) - 1) {
-            line[len++] = (char)c;
-        }
-    }
-}
-
-/* ---------------- Wi-Fi list page ---------------- */
-#define PAGE_DASHBOARD 0
-#define PAGE_WIFI     1
-
-static int g_page = PAGE_DASHBOARD;
-
-/* Draw a small signal-strength bar (4 segments) at (x, y). */
-static void draw_signal_bars(int x, int y, int bars)
-{
-    for (int i = 0; i < 4; i++) {
-        int h = 3 + i * 2;
-        uint16_t color = (i < bars) ? TFT_COLOR_GREEN : TFT_COLOR_DARKGRAY;
-        tft_fill_rect(g_disp, x + i * 3, y + (6 - h), 2, h, color);
-    }
-}
-
-/*
- * The Wi-Fi page lists the nearby networks that can be joined:
- *   - SSID (truncated to fit)
- *   - security type (OPEN / WPA2 / ...)
- *   - signal strength as bars
- *   - channel
- */
-static void render_wifi_page(void)
-{
-    wifi_page_state_t st;
-    wifi_page_get(&st);
-
-    /* 64 bytes: "LINKED: " + a 32 byte SSID + NUL */
-    char buf[64];
-
-    tft_clear(g_disp, TFT_COLOR_BLACK);
-
-    /* header */
-    tft_fill_rect(g_disp, 0, 0, FB_WIDTH, 34, TFT_COLOR_DARKGRAY);
-    tft_draw_text(g_disp, 6, 5, "WIFI NETWORKS", TFT_COLOR_CYAN, TFT_FONT_MEDIUM, 1);
-    tft_draw_hline(g_disp, 0, 34, FB_WIDTH, TFT_COLOR_GRAY, 1);
-
-    /* status line: connection state */
-    if (st.connected) {
-        snprintf(buf, sizeof(buf), "LINKED: %s", st.connected_ssid);
-        tft_draw_text(g_disp, 4, 38, buf, TFT_COLOR_GREEN, TFT_FONT_SMALL, 1);
-        if (st.ip[0]) {
-            snprintf(buf, sizeof(buf), "IP %s", st.ip);
-            tft_draw_text(g_disp, 4, 48, buf, TFT_COLOR_YELLOW, TFT_FONT_SMALL, 1);
-        }
-    } else {
-        snprintf(buf, sizeof(buf), "STATUS: %s", st.status);
-        tft_draw_text(g_disp, 4, 38, buf, TFT_COLOR_ORANGE, TFT_FONT_SMALL, 1);
-    }
-
-    /* column headers */
-    tft_draw_text(g_disp, 4, 62, "SSID", TFT_COLOR_GRAY, TFT_FONT_SMALL, 1);
-    tft_draw_text(g_disp, 150, 62, "SEC", TFT_COLOR_GRAY, TFT_FONT_SMALL, 1);
-    tft_draw_text(g_disp, 196, 62, "SIG", TFT_COLOR_GRAY, TFT_FONT_SMALL, 1);
-    tft_draw_text(g_disp, 220, 62, "CH", TFT_COLOR_GRAY, TFT_FONT_SMALL, 1);
-    tft_draw_hline(g_disp, 0, 72, FB_WIDTH, TFT_COLOR_DARKGRAY, 1);
-
-    /* list rows */
-    int row_y = 76;
-    const int row_h = 16;
-    for (int i = 0; i < st.count && i < 8; i++) {
-        const wifi_page_ap_t *ap = &st.aps[i];
-
-        /* SSID, clipped to the column */
-        char ssid[33];
-        snprintf(ssid, sizeof(ssid), "%s", ap->ssid);
-        tft_draw_text(g_disp, 4, row_y, ssid, TFT_COLOR_WHITE, TFT_FONT_SMALL, 1);
-
-        /* security */
-        tft_draw_text(g_disp, 150, row_y, wifi_auth_label(ap->auth),
-                      ap->auth == WIFI_AUTH_OPEN ? TFT_COLOR_ORANGE : TFT_COLOR_LIGHTGRAY,
-                      TFT_FONT_SMALL, 1);
-
-        /* signal bars */
-        draw_signal_bars(196, row_y, wifi_rssi_bars(ap->rssi));
-
-        /* channel */
-        snprintf(buf, sizeof(buf), "%d", ap->channel);
-        tft_draw_text(g_disp, 220, row_y, buf, TFT_COLOR_LIGHTGRAY, TFT_FONT_SMALL, 1);
-
-        /* highlight the network we are connected to */
-        if (st.connected && strcmp(ap->ssid, st.connected_ssid) == 0) {
-            tft_draw_text(g_disp, 132, row_y, "*", TFT_COLOR_GREEN, TFT_FONT_SMALL, 1);
-        }
-
-        row_y += row_h;
-    }
-
-    if (st.count == 0) {
-        tft_draw_text(g_disp, 4, 90, st.scanning ? "SCANNING..." : "NO NETWORKS FOUND",
-                      TFT_COLOR_GRAY, TFT_FONT_SMALL, 1);
-    }
-
-    /* footer */
-    tft_draw_hline(g_disp, 0, FB_HEIGHT - 40, FB_WIDTH, TFT_COLOR_GRAY, 1);
-    snprintf(buf, sizeof(buf), "%d AP FOUND", st.total);
-    tft_draw_text(g_disp, 4, FB_HEIGHT - 34, buf, TFT_COLOR_CYAN, TFT_FONT_SMALL, 1);
-    tft_draw_text(g_disp, 4, FB_HEIGHT - 22, "BOOT: PAGE / ORIENT",
-                  TFT_COLOR_LIGHTGRAY, TFT_FONT_SMALL, 1);
-
-    ESP_ERROR_CHECK(tft_flush(g_disp));
-}
-
-/* ---------------- telemetry task ---------------- */
-static void telemetry_task(void *arg)
-{
-    TickType_t last_wifi_scan = 0;
-    while (1) {
-        board_info_t info = {
-            .uptime_s = (uint32_t)(esp_timer_get_time() / 1000000ULL),
-            .free_heap = esp_get_free_heap_size(),
-            .min_heap = esp_get_minimum_free_heap_size(),
-            .ap_count = g_wifi_ap_count,
-            .best_rssi = g_wifi_best_rssi,
-            .best_channel = g_wifi_best_channel,
-        };
-        esp_chip_info_t chip;
-        esp_chip_info(&chip);
-        snprintf(info.revision, sizeof(info.revision), "%d.%d",
-                 chip.revision / 100, chip.revision % 100);
-        uint8_t mac[6] = {0};
-        esp_read_mac(mac, ESP_MAC_WIFI_STA);
-        snprintf(info.mac, sizeof(info.mac), "%02X:%02X:%02X:%02X:%02X:%02X",
-                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-
-        xSemaphoreTake(g_info_mutex, portMAX_DELAY);
-        g_info = info;
-        xSemaphoreGive(g_info_mutex);
-
-        hist_push((int)info.free_heap, (int)info.min_heap);
-
-        /* serial telemetry: keep the format the PC GUI expects */
-        printf("@DATA {\"uptime_s\":%" PRIu32 ",\"free_heap\":%zu,\"min_heap\":%zu,"
-               "\"ap_count\":%d,\"best_rssi\":%d,\"best_channel\":%d,\"revision\":\"%s\"}\n",
-               info.uptime_s, info.free_heap, info.min_heap, info.ap_count,
-               info.best_rssi, info.best_channel, info.revision);
-        fflush(stdout);
-
-        /* periodic wifi rescan */
-        if (xTaskGetTickCount() - last_wifi_scan > pdMS_TO_TICKS(30000)) {
-            last_wifi_scan = xTaskGetTickCount();
-            if (esp_wifi_scan_start(NULL, true) == ESP_OK) {
-                wifi_page_set_scanning(true);
-            }
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
-}
-
-/* ---------------- BOOT key: short press = page, long press = orientation ------ */
-#define BOOT_GPIO GPIO_NUM_0
-#define BOOT_LONG_PRESS_MS 1200
-
-static void render_current_page(void)
-{
-    if (g_page == PAGE_WIFI) {
-        render_wifi_page();
-    } else {
-        render_dashboard();
-    }
-}
 
 static void boot_key_task(void *arg)
 {
@@ -944,9 +1112,22 @@ static void boot_key_task(void *arg)
             }
 
             if (long_press) {
-                /* long press: rotate the screen */
+                /* long press: rotate the screen.
+                 * The MADCTL change and the redraw must not interleave with
+                 * the dashboard task, otherwise the panel gets the new
+                 * orientation with a half-drawn old frame. */
+                if (g_render_mutex) {
+                    xSemaphoreTake(g_render_mutex, portMAX_DELAY);
+                }
                 apply_orientation(g_orient + 1);
-                render_current_page();
+                if (g_page == PAGE_WIFI) {
+                    render_wifi_page();
+                } else {
+                    render_dashboard();
+                }
+                if (g_render_mutex) {
+                    xSemaphoreGive(g_render_mutex);
+                }
                 ESP_LOGI(TAG, "long press: orientation -> %d", g_orient);
             } else {
                 /* short press: switch page */
@@ -982,6 +1163,9 @@ void app_main(void)
 
     g_info_mutex = xSemaphoreCreateMutex();
     ESP_ERROR_CHECK(g_info_mutex ? ESP_OK : ESP_ERR_NO_MEM);
+
+    g_render_mutex = xSemaphoreCreateMutex();
+    ESP_ERROR_CHECK(g_render_mutex ? ESP_OK : ESP_ERR_NO_MEM);
 
     /* Allocate the TFT frame buffer BEFORE the Wi-Fi driver starts.
      * This ESP32 (rev 1.1) has no PSRAM, so the 240x320x2 = 153600 byte

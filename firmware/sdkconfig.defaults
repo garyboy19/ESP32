@@ -1,0 +1,18 @@
+# 固件默认配置（ESP-IDF v6.1）
+#
+# 这些值固化了可复现构建所需的关键选项。完整配置见 sdkconfig
+# （该文件被 .gitignore 排除，因为它随 IDF 版本和本地环境变化）。
+#
+# 注意：分区表从「1 MB app」改为「2 MB app + 1 MB storage」，
+# 是为了容纳扩大的中文字库（218 KB）。改变分区表布局后必须
+# 先 erase-flash 再刷写，否则引导程序找不到 app，设备无法启动。
+
+# --- Flash ---
+CONFIG_ESPTOOLPY_FLASHMODE="dio"
+CONFIG_ESPTOOLPY_FLASHFREQ="40m"
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# --- 分区表 ---
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000

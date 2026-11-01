@@ -10,6 +10,8 @@
 | `export.sh/` | 环境激活脚本 |
 | `firmware/` | ESP32 开发板自检与遥测固件 |
 | `firmware/components/ili9341/` | ILI9341 TFT 驱动 + 绘图层组件 |
+| `firmware/release/` | 可复现的烧录产物（bootloader / 分区表 / firmware.bin + MANIFEST） |
+| `firmware/tools/gen_cjk_font.py` | 中文字库生成脚本 |
 | `firmware/TFT_WIRING.md` | TFT 接线说明与排错指南 |
 | `gui/board_monitor.py` | 桌面实时监控界面 |
 | `activate.sh` | 一键激活当前终端 |
@@ -75,10 +77,14 @@ TFT 模式启动后屏幕显示开机自检画面（含红绿蓝彩条，用于�
 | `components/ili9341/tft_disp.c` | RGB565 绘图层：矩形 / 线条 / 文字 / 图表 / 分块刷屏 |
 | `components/ili9341/include/font6x8.h` | 6×8 ASCII 点阵字体 |
 | `components/ili9341/include/font11x16.h` | 11×16 ASCII 点阵字体 |
+| `components/ili9341/include/font9x13.h` | 9×13 ASCII 点阵字体 |
+| `components/ili9341/include/font_cjk16.bin` | 16×16 中文字库（3968 字，124 KB，存在 flash） |
+| `components/ili9341/include/tft_cjk.h` | 中文字库查询 / UTF-8 解码接口 |
 | `main/tft_dashboard.c` | 仪表盘主程序，复用板卡遥测数据 |
 | `main/wifi_page.c` | Wi-Fi 扫描结果缓存（紧凑结构体 + 互斥锁） |
 | `main/wifi_page.h` | Wi-Fi 页面状态接口 |
 | `tools/gen_font.py` | 用 Pillow 重新生成点阵字体 |
+| `tools/gen_cjk_font.py` | 用 Pillow 重新生成中文字库 |
 
 开机画面含**左三角/右方块**不对称标记与从左到右的彩条，用于确认屏幕方向是否镜像。
 
@@ -95,7 +101,7 @@ TFT 模式有两个页面，用板载 **BOOT 键**切换：
 | 短按 | 切换 仪表盘 ↔ Wi-Fi 网络列表 |
 | 长按（1.2s） | 循环切换屏幕方向（MX/MY 组合） |
 
-Wi-Fi 页面列出扫描到的可连接网络：**SSID、加密类型（OPEN/WPA2/WPA3…）、信号强度格、信道**，
+Wi-Fi 页面列出扫描到的可连接网络：**名称、加密类型（开放/WPA2/WPA3…）、信号强度格、信道**，
 顶部显示当前连接状态与 IP，已连接的网络行前带 `*` 标记。页面在开机时自动扫描一次，
 之后每 30 秒重扫，也可在 GUI 里手动触发。
 
@@ -113,7 +119,40 @@ Wi-Fi 页面列出扫描到的可连接网络：**SSID、加密类型（OPEN/WPA
 SSID 与密码都支持**双引号包裹**（含空格的 SSID 必须加引号），也兼容不带引号的旧格式。
 固件以 `@WIFI {...}` 单行 JSON 回复；**密码不会被回显或写进日志**。
 
+### 中文显示
+
+屏幕界面已全面中文化。固件内置 **GB2312 一级汉字（3755 字）+ 常用标点 + ASCII**，
+共 3968 个 16×16 点阵字形。
+
+字库共 124 KB，**存在 flash 里不占 RAM**（通过 ESP-IDF `EMBED_FILES` 嵌入，
+运行时按需读取）。实测固件启动后可用堆 48604 字节，与引入中文字库前完全一致。
+
+重新生成字库：
+
+```bash
+cd firmware/tools && python3 gen_cjk_font.py
+```
+
+界面里出现字库中没有的汉字会显示空白 —— 把新字加进 `gen_cjk_font.py` 的
+`EXTRA` 字符串重新生成即可，每个汉字约 32 字节 flash。
+
 接线方式、常见花屏/黑屏排查见 **[firmware/TFT_WIRING.md](firmware/TFT_WIRING.md)**。
+
+## 固件发布产物
+
+可复现的烧录产物保存在 `firmware/release/`（已纳入 Git）：
+
+| 文件 | 大小 |
+|---|---|
+| `bootloader.bin` | 26,176 B |
+| `partition-table.bin` | 3,072 B |
+| `firmware.bin` | 1,096,800 B |
+| `MANIFEST.md` | 版本、SHA-256、烧录步骤、已知限制 |
+
+烧录方法、校验值和分区表变更注意事项见 `firmware/release/MANIFEST.md`。
+
+> ⚠️ 分区表已从 1 MB app 改为 **2 MB app + 1 MB storage**（容纳扩大的中文字库）。
+> 首次刷写必须先 `erase-flash`，否则引导程序找不到 app 无法启动。
 
 ## 版本控制
 
