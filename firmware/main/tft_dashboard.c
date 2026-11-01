@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -24,11 +25,13 @@
 #include "esp_netif.h"
 #include "nvs_flash.h"
 #include "driver/gpio.h"
+#include "driver/uart.h"
 #include "driver/spi_master.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_ili9341.h"
 #include "tft_disp.h"
+#include "wifi_page.h"
 
 static const char *TAG = "tft_dash";
 
@@ -64,12 +67,42 @@ static SemaphoreHandle_t g_info_mutex;
 static int g_wifi_ap_count;
 static int g_wifi_best_rssi;
 static int g_wifi_best_channel;
+static esp_netif_t *g_sta_netif;
+
+/* Security label for the Wi-Fi list, indexed by wifi_auth_mode_t. */
+static const char *wifi_auth_label(uint8_t auth)
+{
+    switch (auth) {
+    case WIFI_AUTH_OPEN:                  return "OPEN";
+    case WIFI_AUTH_WEP:                   return "WEP";
+    case WIFI_AUTH_WPA_PSK:               return "WPA";
+    case WIFI_AUTH_WPA2_PSK:              return "WPA2";
+    case WIFI_AUTH_WPA_WPA2_PSK:          return "WPA2";
+    case WIFI_AUTH_WPA3_PSK:              return "WPA3";
+    case WIFI_AUTH_WPA2_WPA3_PSK:         return "WPA3";
+    case WIFI_AUTH_OWE:                   return "OWE";
+    case WIFI_AUTH_WAPI_PSK:              return "WAPI";
+    case WIFI_AUTH_ENTERPRISE:            return "EAP";
+    default:                              return "SEC";
+    }
+}
+
+/* Signal strength as a 0-4 bar count, for the list rows. */
+static int wifi_rssi_bars(int8_t rssi)
+{
+    if (rssi >= -55) return 4;
+    if (rssi >= -67) return 3;
+    if (rssi >= -78) return 2;
+    if (rssi >= -90) return 1;
+    return 0;
+}
 
 static void wifi_scan_done(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (id != WIFI_EVENT_SCAN_DONE) {
         return;
     }
+    wifi_page_set_scanning(false);
     uint16_t number = 0;
     if (esp_wifi_scan_get_ap_num(&number) != ESP_OK) {
         return;
@@ -87,9 +120,13 @@ static void wifi_scan_done(void *arg, esp_event_base_t base, int32_t id, void *d
                         chan = records[i].primary;
                     }
                 }
+                /* keep a compact copy for the on-screen list */
+                wifi_page_store_scan(records, (int)show, (int)number);
             }
             free(records);
         }
+    } else {
+        wifi_page_store_scan(NULL, 0, (int)number);
     }
     g_wifi_ap_count = number;
     g_wifi_best_rssi = best;
@@ -97,14 +134,32 @@ static void wifi_scan_done(void *arg, esp_event_base_t base, int32_t id, void *d
     ESP_LOGI(TAG, "wifi scan: %d aps, best %d dBm ch%d", number, best, chan);
 }
 
+static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_page_set_status("disconnected");
+        wifi_page_clear_connected();
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
+        char ipstr[16];
+        snprintf(ipstr, sizeof(ipstr), IPSTR, IP2STR(&event->ip_info.ip));
+        wifi_page_set_connected(NULL, ipstr);
+        wifi_page_set_status("connected");
+        ESP_LOGI(TAG, "got ip: %s", ipstr);
+    }
+}
+
 static void wifi_init(void)
 {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+    g_sta_netif = esp_netif_create_default_wifi_sta();
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                                         &wifi_scan_done, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                        &wifi_event_handler, NULL, NULL));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
 }
@@ -115,6 +170,8 @@ static esp_lcd_panel_handle_t g_panel;
 static tft_disp_t *g_disp;
 
 static void draw_splash(void);
+static void render_dashboard(void);
+static void render_wifi_page(void);
 
 /*
  * Orientation presets.
@@ -438,6 +495,367 @@ static void render_dashboard(void)
     ESP_ERROR_CHECK(tft_flush(g_disp));
 }
 
+/* ---------------- serial command interface ----------------
+ *
+ * Commands are line based and start with "@CMD ":
+ *   @CMD SCAN                       start a Wi-Fi scan
+ *   @CMD CONNECT <ssid> [password]  join a network (open network if no password)
+ *   @CMD DISCONNECT                 leave the current network
+ *
+ * Replies use "@WIFI ..." so the PC side GUI can pick them up.
+ * The password is never echoed back.
+ */
+
+static void wifi_reply(const char *fmt, ...)
+{
+    /* Static buffer: the heap is tight (no PSRAM) and this must not fail. */
+    static char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    printf("@WIFI %s\n", buf);
+    fflush(stdout);
+}
+
+/*
+ * Reply with the cached list so the GUI can show what the screen shows.
+ *
+ * The whole JSON is built in one buffer and printed as a single line - the
+ * GUI parses it with json.loads(), so it must not be split across lines.
+ */
+static void wifi_reply_list(void)
+{
+    wifi_page_state_t st;
+    wifi_page_get(&st);
+
+    /* Worst case: 12 entries x ~96 bytes + a small header. */
+    static char buf[1600];
+    int n = snprintf(buf, sizeof(buf),
+                     "{\"type\":\"list\",\"total\":%d,\"count\":%d,"
+                     "\"connected\":%s,\"ssid\":\"%s\",\"ip\":\"%s\",\"aps\":[",
+                     st.total, st.count, st.connected ? "true" : "false",
+                     st.connected_ssid, st.ip);
+    if (n < 0 || (size_t)n >= sizeof(buf)) {
+        return;
+    }
+    size_t used = (size_t)n;
+
+    for (int i = 0; i < st.count; i++) {
+        int m = snprintf(buf + used, sizeof(buf) - used,
+                         "%s{\"ssid\":\"%s\",\"rssi\":%d,\"ch\":%d,"
+                         "\"sec\":\"%s\",\"open\":%s}",
+                         i ? "," : "", st.aps[i].ssid, st.aps[i].rssi,
+                         st.aps[i].channel, wifi_auth_label(st.aps[i].auth),
+                         st.aps[i].auth == WIFI_AUTH_OPEN ? "true" : "false");
+        if (m < 0 || (size_t)m >= sizeof(buf) - used) {
+            break;
+        }
+        used += (size_t)m;
+    }
+
+    if (used + 3 < sizeof(buf)) {
+        buf[used++] = ']';
+        buf[used++] = '}';
+        buf[used] = '\0';
+        printf("@WIFI %s\n", buf);
+        fflush(stdout);
+    }
+}
+
+static void wifi_do_connect(const char *ssid, const char *password)
+{
+    if (!ssid || !ssid[0]) {
+        wifi_reply("{\"type\":\"error\",\"msg\":\"missing ssid\"}");
+        return;
+    }
+
+    wifi_config_t cfg = { 0 };
+    wifi_sta_config_t *sta = &cfg.sta;
+
+    snprintf((char *)sta->ssid, sizeof(sta->ssid), "%s", ssid);
+    sta->ssid[sizeof(sta->ssid) - 1] = '\0';
+
+    if (password && password[0]) {
+        snprintf((char *)sta->password, sizeof(sta->password), "%s", password);
+        sta->password[sizeof(sta->password) - 1] = '\0';
+        sta->threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    } else {
+        sta->password[0] = '\0';
+        sta->threshold.authmode = WIFI_AUTH_OPEN;
+    }
+
+    /* keep scanning and the dashboard alive while the join is in progress */
+    esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    if (err != ESP_OK) {
+        wifi_page_set_status("config failed");
+        wifi_reply("{\"type\":\"error\",\"msg\":\"set_config %d\",\"ssid\":\"%s\"}",
+                   (int)err, ssid);
+        return;
+    }
+
+    err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        wifi_page_set_status("connect failed");
+        wifi_reply("{\"type\":\"error\",\"msg\":\"connect %d\",\"ssid\":\"%s\"}",
+                   (int)err, ssid);
+        return;
+    }
+
+    wifi_page_set_connected(ssid, "");
+    wifi_page_set_status("connecting");
+    ESP_LOGI(TAG, "connecting to '%s' (password %s)", ssid, password && password[0] ? "given" : "none");
+    wifi_reply("{\"type\":\"connecting\",\"ssid\":\"%s\"}", ssid);
+}
+
+static void wifi_do_disconnect(void)
+{
+    esp_err_t err = esp_wifi_disconnect();
+    wifi_page_clear_connected();
+    wifi_page_set_status("disconnected");
+    wifi_reply("{\"type\":\"disconnected\",\"err\":%d}", (int)err);
+}
+
+/*
+ * Parse and run one command line. Returns true if the line was a command.
+ */
+static bool handle_command(const char *line)
+{
+    if (strncmp(line, "@CMD ", 5) != 0) {
+        return false;
+    }
+    const char *args = line + 5;
+
+    if (strncmp(args, "SCAN", 4) == 0) {
+        esp_err_t err = esp_wifi_scan_start(NULL, true);
+        wifi_page_set_scanning(err == ESP_OK);
+        wifi_reply("{\"type\":\"scan\",\"err\":%d}", (int)err);
+        return true;
+    }
+    if (strncmp(args, "LIST", 4) == 0) {
+        wifi_reply_list();
+        return true;
+    }
+    if (strncmp(args, "DISCONNECT", 10) == 0) {
+        wifi_do_disconnect();
+        return true;
+    }
+    if (strncmp(args, "CONNECT ", 8) == 0) {
+        args += 8;
+        char ssid[33];
+        char password[65];
+        password[0] = '\0';
+
+        /* Both the SSID and the password may be quoted so that names with
+         * spaces survive the round trip. Strip the quotes and unescape
+         * backslash-escaped characters. */
+        const char *p = args;
+        char *out = ssid;
+        size_t out_len = 0;
+        bool in_quotes = false;
+
+        /* Read the SSID. A quoted token may contain spaces; an unquoted one
+         * ends at the first space. */
+        while (*p && out_len < sizeof(ssid) - 1) {
+            if (*p == '"') {
+                in_quotes = !in_quotes;
+                p++;
+                continue;
+            }
+            if (!in_quotes && *p == ' ') {
+                break;
+            }
+            if (*p == '\\' && p[1] != '\0') {
+                p++;
+            }
+            *out++ = *p++;
+            out_len++;
+        }
+        *out = '\0';
+
+        /* The password is the rest of the line (may also be quoted). */
+        while (*p == ' ') {
+            p++;
+        }
+        out = password;
+        out_len = 0;
+        in_quotes = false;
+        while (*p && out_len < sizeof(password) - 1) {
+            if (*p == '"') {
+                in_quotes = !in_quotes;
+                p++;
+                continue;
+            }
+            if (*p == '\\' && p[1] != '\0') {
+                p++;
+            }
+            *out++ = *p++;
+            out_len++;
+        }
+        *out = '\0';
+
+        wifi_do_connect(ssid, password[0] ? password : NULL);
+        return true;
+    }
+
+    wifi_reply("{\"type\":\"error\",\"msg\":\"unknown command\"}");
+    return true;
+}
+
+/*
+ * Serial command task.
+ *
+ * The project does not link esp_console, so no UART driver is installed yet.
+ * Installing one with tx_buffer_size = 0 keeps stdout working (writes go
+ * straight to the FIFO) while giving us an interrupt driven RX buffer.
+ */
+static void serial_cmd_task(void *arg)
+{
+    static char line[160];
+    int len = 0;
+
+    const uart_port_t port = UART_NUM_0;
+    if (!uart_is_driver_installed(port)) {
+        /* rx_buffer_size must be > the 128 byte HW FIFO, tx stays at 0 so
+         * that printf()/stdout keeps using the direct FIFO path. */
+        esp_err_t err = uart_driver_install(port, 1024, 0, 0, NULL, 0);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "uart driver install failed: %s", esp_err_to_name(err));
+            return;
+        }
+        ESP_LOGI(TAG, "uart rx driver installed");
+    }
+
+    while (1) {
+        uint8_t c;
+        int n = uart_read_bytes(port, &c, 1, pdMS_TO_TICKS(50));
+        if (n <= 0) {
+            continue;
+        }
+        if (c == '\r' || c == '\n') {
+            if (len > 0) {
+                line[len] = '\0';
+                handle_command(line);
+                len = 0;
+            }
+            continue;
+        }
+        if (c == 8 || c == 127) { /* backspace */
+            if (len > 0) {
+                len--;
+            }
+            continue;
+        }
+        if (len < (int)sizeof(line) - 1) {
+            line[len++] = (char)c;
+        }
+    }
+}
+
+/* ---------------- Wi-Fi list page ---------------- */
+#define PAGE_DASHBOARD 0
+#define PAGE_WIFI     1
+
+static int g_page = PAGE_DASHBOARD;
+
+/* Draw a small signal-strength bar (4 segments) at (x, y). */
+static void draw_signal_bars(int x, int y, int bars)
+{
+    for (int i = 0; i < 4; i++) {
+        int h = 3 + i * 2;
+        uint16_t color = (i < bars) ? TFT_COLOR_GREEN : TFT_COLOR_DARKGRAY;
+        tft_fill_rect(g_disp, x + i * 3, y + (6 - h), 2, h, color);
+    }
+}
+
+/*
+ * The Wi-Fi page lists the nearby networks that can be joined:
+ *   - SSID (truncated to fit)
+ *   - security type (OPEN / WPA2 / ...)
+ *   - signal strength as bars
+ *   - channel
+ */
+static void render_wifi_page(void)
+{
+    wifi_page_state_t st;
+    wifi_page_get(&st);
+
+    /* 64 bytes: "LINKED: " + a 32 byte SSID + NUL */
+    char buf[64];
+
+    tft_clear(g_disp, TFT_COLOR_BLACK);
+
+    /* header */
+    tft_fill_rect(g_disp, 0, 0, FB_WIDTH, 34, TFT_COLOR_DARKGRAY);
+    tft_draw_text(g_disp, 6, 5, "WIFI NETWORKS", TFT_COLOR_CYAN, TFT_FONT_MEDIUM, 1);
+    tft_draw_hline(g_disp, 0, 34, FB_WIDTH, TFT_COLOR_GRAY, 1);
+
+    /* status line: connection state */
+    if (st.connected) {
+        snprintf(buf, sizeof(buf), "LINKED: %s", st.connected_ssid);
+        tft_draw_text(g_disp, 4, 38, buf, TFT_COLOR_GREEN, TFT_FONT_SMALL, 1);
+        if (st.ip[0]) {
+            snprintf(buf, sizeof(buf), "IP %s", st.ip);
+            tft_draw_text(g_disp, 4, 48, buf, TFT_COLOR_YELLOW, TFT_FONT_SMALL, 1);
+        }
+    } else {
+        snprintf(buf, sizeof(buf), "STATUS: %s", st.status);
+        tft_draw_text(g_disp, 4, 38, buf, TFT_COLOR_ORANGE, TFT_FONT_SMALL, 1);
+    }
+
+    /* column headers */
+    tft_draw_text(g_disp, 4, 62, "SSID", TFT_COLOR_GRAY, TFT_FONT_SMALL, 1);
+    tft_draw_text(g_disp, 150, 62, "SEC", TFT_COLOR_GRAY, TFT_FONT_SMALL, 1);
+    tft_draw_text(g_disp, 196, 62, "SIG", TFT_COLOR_GRAY, TFT_FONT_SMALL, 1);
+    tft_draw_text(g_disp, 220, 62, "CH", TFT_COLOR_GRAY, TFT_FONT_SMALL, 1);
+    tft_draw_hline(g_disp, 0, 72, FB_WIDTH, TFT_COLOR_DARKGRAY, 1);
+
+    /* list rows */
+    int row_y = 76;
+    const int row_h = 16;
+    for (int i = 0; i < st.count && i < 8; i++) {
+        const wifi_page_ap_t *ap = &st.aps[i];
+
+        /* SSID, clipped to the column */
+        char ssid[33];
+        snprintf(ssid, sizeof(ssid), "%s", ap->ssid);
+        tft_draw_text(g_disp, 4, row_y, ssid, TFT_COLOR_WHITE, TFT_FONT_SMALL, 1);
+
+        /* security */
+        tft_draw_text(g_disp, 150, row_y, wifi_auth_label(ap->auth),
+                      ap->auth == WIFI_AUTH_OPEN ? TFT_COLOR_ORANGE : TFT_COLOR_LIGHTGRAY,
+                      TFT_FONT_SMALL, 1);
+
+        /* signal bars */
+        draw_signal_bars(196, row_y, wifi_rssi_bars(ap->rssi));
+
+        /* channel */
+        snprintf(buf, sizeof(buf), "%d", ap->channel);
+        tft_draw_text(g_disp, 220, row_y, buf, TFT_COLOR_LIGHTGRAY, TFT_FONT_SMALL, 1);
+
+        /* highlight the network we are connected to */
+        if (st.connected && strcmp(ap->ssid, st.connected_ssid) == 0) {
+            tft_draw_text(g_disp, 132, row_y, "*", TFT_COLOR_GREEN, TFT_FONT_SMALL, 1);
+        }
+
+        row_y += row_h;
+    }
+
+    if (st.count == 0) {
+        tft_draw_text(g_disp, 4, 90, st.scanning ? "SCANNING..." : "NO NETWORKS FOUND",
+                      TFT_COLOR_GRAY, TFT_FONT_SMALL, 1);
+    }
+
+    /* footer */
+    tft_draw_hline(g_disp, 0, FB_HEIGHT - 40, FB_WIDTH, TFT_COLOR_GRAY, 1);
+    snprintf(buf, sizeof(buf), "%d AP FOUND", st.total);
+    tft_draw_text(g_disp, 4, FB_HEIGHT - 34, buf, TFT_COLOR_CYAN, TFT_FONT_SMALL, 1);
+    tft_draw_text(g_disp, 4, FB_HEIGHT - 22, "BOOT: PAGE / ORIENT",
+                  TFT_COLOR_LIGHTGRAY, TFT_FONT_SMALL, 1);
+
+    ESP_ERROR_CHECK(tft_flush(g_disp));
+}
+
 /* ---------------- telemetry task ---------------- */
 static void telemetry_task(void *arg)
 {
@@ -476,15 +894,27 @@ static void telemetry_task(void *arg)
         /* periodic wifi rescan */
         if (xTaskGetTickCount() - last_wifi_scan > pdMS_TO_TICKS(30000)) {
             last_wifi_scan = xTaskGetTickCount();
-            esp_wifi_scan_start(NULL, true);
+            if (esp_wifi_scan_start(NULL, true) == ESP_OK) {
+                wifi_page_set_scanning(true);
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
 
-/* ---------------- BOOT key: cycle screen orientation ---------------- */
+/* ---------------- BOOT key: short press = page, long press = orientation ------ */
 #define BOOT_GPIO GPIO_NUM_0
+#define BOOT_LONG_PRESS_MS 1200
+
+static void render_current_page(void)
+{
+    if (g_page == PAGE_WIFI) {
+        render_wifi_page();
+    } else {
+        render_dashboard();
+    }
+}
 
 static void boot_key_task(void *arg)
 {
@@ -502,10 +932,27 @@ static void boot_key_task(void *arg)
         int lvl = gpio_get_level(BOOT_GPIO);
         if (last == 1 && lvl == 0) {
             /* falling edge: button just pressed */
-            vTaskDelay(pdMS_TO_TICKS(50));
-            if (gpio_get_level(BOOT_GPIO) == 0) {
+            TickType_t press_start = xTaskGetTickCount();
+            bool long_press = false;
+
+            while (gpio_get_level(BOOT_GPIO) == 0) {
+                if ((xTaskGetTickCount() - press_start) > pdMS_TO_TICKS(BOOT_LONG_PRESS_MS)) {
+                    long_press = true;
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(20));
+            }
+
+            if (long_press) {
+                /* long press: rotate the screen */
                 apply_orientation(g_orient + 1);
-                render_dashboard();
+                render_current_page();
+                ESP_LOGI(TAG, "long press: orientation -> %d", g_orient);
+            } else {
+                /* short press: switch page */
+                g_page = (g_page == PAGE_DASHBOARD) ? PAGE_WIFI : PAGE_DASHBOARD;
+                render_current_page();
+                ESP_LOGI(TAG, "short press: page -> %d", g_page);
             }
         }
         last = lvl;
@@ -519,7 +966,7 @@ static void dashboard_task(void *arg)
     /* let the panel settle after init */
     vTaskDelay(pdMS_TO_TICKS(300));
     while (1) {
-        render_dashboard();
+        render_current_page();
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
@@ -543,11 +990,19 @@ void app_main(void)
      */
     tft_bringup();
 
+    wifi_page_init();
     wifi_init();
+
+    /* Kick off the first scan right away so the Wi-Fi page is not empty
+     * when the user switches to it. */
+    if (esp_wifi_scan_start(NULL, true) == ESP_OK) {
+        wifi_page_set_scanning(true);
+    }
 
     xTaskCreatePinnedToCore(telemetry_task, "telemetry", 4096, NULL, 4, NULL, 0);
     xTaskCreatePinnedToCore(dashboard_task, "dashboard", 6144, NULL, 3, NULL, 1);
     xTaskCreatePinnedToCore(boot_key_task, "bootkey", 2560, NULL, 2, NULL, 0);
+    xTaskCreatePinnedToCore(serial_cmd_task, "serialcmd", 4096, NULL, 4, NULL, 0);
 
     ESP_LOGI(TAG, "dashboard started");
 }

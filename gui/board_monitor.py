@@ -49,6 +49,13 @@ class BoardMonitor:
         self.leak_ratio_threshold = 0.10
         self.leak_detected = False
         self.closed = False
+        # Wi-Fi 面板状态
+        self.wifi_aps: list[dict[str, object]] = []
+        self.wifi_selected: str | None = None
+        self.wifi_status = "—"
+        self.wifi_connected_ssid = ""
+        self.wifi_ip = ""
+        self.wifi_total = 0
 
         self._build_ui()
         self.refresh_ports()
@@ -153,6 +160,66 @@ class BoardMonitor:
             value.pack(side="right")
             self.info_labels[key] = value
 
+        # ---------------- Wi-Fi panel ----------------
+        wifi_panel = tk.Frame(outer, bg=PANEL, padx=14, pady=12)
+        wifi_panel.pack(fill="x", pady=(0, 14))
+
+        wifi_head = tk.Frame(wifi_panel, bg=PANEL)
+        wifi_head.pack(fill="x")
+        tk.Label(wifi_head, text="Wi‑Fi 网络", bg=PANEL, fg=TEXT,
+                 font=("Arial", 12, "bold")).pack(side="left")
+        self.wifi_status_label = tk.Label(wifi_head, text="—", bg=PANEL, fg=MUTED,
+                                          font=("Arial", 9))
+        self.wifi_status_label.pack(side="right")
+
+        wifi_body = tk.Frame(wifi_panel, bg=PANEL)
+        wifi_body.pack(fill="x", pady=(10, 0))
+
+        # list
+        list_frame = tk.Frame(wifi_body, bg=PANEL)
+        list_frame.pack(side="left", fill="both", expand=True, padx=(0, 12))
+        list_scroll = tk.Scrollbar(list_frame, orient="vertical", width=12)
+        list_scroll.pack(side="right", fill="y")
+        self.wifi_list = tk.Listbox(list_frame, height=6, bg=PANEL_2, fg=TEXT,
+                                    selectbackground="#2f4a7a", highlightthickness=0,
+                                    font=("Arial", 9), activestyle="none",
+                                    exportselection=False)
+        self.wifi_list.pack(side="left", fill="both", expand=True)
+        self.wifi_list.config(yscrollcommand=list_scroll.set)
+        list_scroll.config(command=self.wifi_list.yview)
+        self.wifi_list.bind("<<ListboxSelect>>", self._on_wifi_select)
+
+        # controls
+        ctrl = tk.Frame(wifi_body, bg=PANEL, width=250)
+        ctrl.pack(side="right", fill="y")
+        ctrl.pack_propagate(False)
+
+        tk.Label(ctrl, text="密码", bg=PANEL, fg=MUTED,
+                 font=("Arial", 9)).pack(anchor="w")
+        self.wifi_password = tk.Entry(ctrl, show="•", bg=PANEL_2, fg=TEXT,
+                                      insertbackground=TEXT, relief="flat",
+                                      font=("Arial", 9))
+        self.wifi_password.pack(fill="x", pady=(3, 8))
+
+        btn_row = tk.Frame(ctrl, bg=PANEL)
+        btn_row.pack(fill="x")
+        tk.Button(btn_row, text="扫描", command=self.wifi_scan,
+                  bg=PANEL_2, fg=TEXT, activebackground=PANEL,
+                  relief="flat", padx=10, font=("Arial", 9)).pack(side="left")
+        tk.Button(btn_row, text="连接", command=self.wifi_connect,
+                  bg=ACCENT, fg="#071610", activebackground="#76e8ca",
+                  relief="flat", padx=10, font=("Arial", 9, "bold")).pack(
+                      side="left", padx=(8, 0))
+        tk.Button(btn_row, text="断开", command=self.wifi_disconnect,
+                  bg=PANEL_2, fg=TEXT, activebackground=PANEL,
+                  relief="flat", padx=10, font=("Arial", 9)).pack(
+                      side="left", padx=(8, 0))
+
+        self.wifi_hint = tk.Label(ctrl, text="选择左侧网络后点连接", bg=PANEL, fg=MUTED,
+                                  font=("Arial", 8), wraplength=235,
+                                  justify="left")
+        self.wifi_hint.pack(anchor="w", pady=(8, 0))
+
         footer = tk.Frame(outer, bg=BG)
         footer.pack(fill="x")
         tk.Label(footer, text="串口波特率 115200 · 遥测由板载固件每秒发送", bg=BG,
@@ -211,6 +278,12 @@ class BoardMonitor:
         self.refresh_button.config(state="disabled")
         self.status_dot.config(fg=ORANGE)
         self.status_text.config(text=f"已连接 {device} · 等待遥测数据")
+        # 拉一次 Wi-Fi 列表，填充面板
+        try:
+            self.port.write(b"@CMD LIST\r\n")
+            self.port.flush()
+        except (serial.SerialException, OSError):
+            pass
         return True
 
     def _read_serial(self) -> None:
@@ -227,6 +300,12 @@ class BoardMonitor:
                     self.messages.put(("data", data))
                 except json.JSONDecodeError:
                     continue
+            elif line.startswith("@WIFI "):
+                try:
+                    data = json.loads(line[6:])
+                    self.messages.put(("wifi", data))
+                except json.JSONDecodeError:
+                    continue
         # 读线程结束：若不是用户主动断开，则安排自动重连
         if not self.stop_event.is_set():
             self.messages.put(("reconnect", None))
@@ -239,6 +318,8 @@ class BoardMonitor:
                 break
             if kind == "data":
                 self._show_data(payload)  # type: ignore[arg-type]
+            elif kind == "wifi":
+                self._show_wifi(payload)  # type: ignore[arg-type]
             elif kind == "error":
                 self.status_text.config(text=f"串口读取错误：{payload}")
                 self.status_dot.config(fg="#ff7b83")
@@ -284,6 +365,107 @@ class BoardMonitor:
         self.info_labels["heap"].config(
             text="疑似泄漏" if self.leak_detected else "正常",
             fg="#ff7b83" if self.leak_detected else ACCENT)
+
+    # ---------------- Wi-Fi panel logic ----------------
+    def _send_cmd(self, command: str) -> bool:
+        """Send a @CMD line to the board. Returns False if not connected."""
+        if not self.connected or self.port is None:
+            messagebox.showinfo("未连接", "请先连接开发板。")
+            return False
+        try:
+            self.port.write(f"@CMD {command}\r\n".encode("utf-8"))
+            self.port.flush()
+        except (serial.SerialException, OSError) as error:
+            self.status_text.config(text=f"命令发送失败：{error}")
+            return False
+        return True
+
+    def wifi_scan(self) -> None:
+        if self._send_cmd("SCAN"):
+            self.wifi_status = "扫描中…"
+            self.wifi_status_label.config(text=self.wifi_status, fg=ORANGE)
+
+    def wifi_connect(self) -> None:
+        if not self.wifi_selected:
+            messagebox.showinfo("未选择网络", "请先在列表中选择一个 Wi‑Fi 网络。")
+            return
+        password = self.wifi_password.get()
+        # SSID 可能含空格，这里用引号包裹并转义
+        ssid = self.wifi_selected.replace("\\", "\\\\").replace('"', '\\"')
+        command = f'CONNECT "{ssid}"'
+        if password:
+            password = password.replace("\\", "\\\\").replace('"', '\\"')
+            command += f' "{password}"'
+        if self._send_cmd(command):
+            self.wifi_status = f"正在连接 {self.wifi_selected}…"
+            self.wifi_status_label.config(text=self.wifi_status, fg=ORANGE)
+
+    def wifi_disconnect(self) -> None:
+        if self._send_cmd("DISCONNECT"):
+            self.wifi_status = "已断开"
+            self.wifi_status_label.config(text=self.wifi_status, fg=MUTED)
+
+    def _on_wifi_select(self, _event: object) -> None:
+        selection = self.wifi_list.curselection()
+        if not selection:
+            return
+        index = selection[0]
+        if index >= len(self.wifi_aps):
+            return
+        self.wifi_selected = str(self.wifi_aps[index].get("ssid", ""))
+        self.wifi_hint.config(text=f"已选择：{self.wifi_selected}")
+
+    def _show_wifi(self, data: dict[str, object]) -> None:
+        kind = str(data.get("type", ""))
+        if kind == "list":
+            self.wifi_aps = list(data.get("aps", []) or [])
+            self.wifi_total = int(data.get("total", 0) or 0)
+            self.wifi_connected_ssid = str(data.get("ssid", "") or "")
+            self.wifi_ip = str(data.get("ip", "") or "")
+            self._refresh_wifi_list()
+            if self.wifi_connected_ssid:
+                self.wifi_status = f"已连接 {self.wifi_connected_ssid}"
+                if self.wifi_ip:
+                    self.wifi_status += f" · {self.wifi_ip}"
+                self.wifi_status_label.config(text=self.wifi_status, fg=ACCENT)
+            else:
+                self.wifi_status = f"发现 {self.wifi_total} 个网络"
+                self.wifi_status_label.config(text=self.wifi_status, fg=MUTED)
+        elif kind == "scan":
+            if int(data.get("err", 0) or 0) == 0:
+                self.wifi_status = "扫描中…"
+                self.wifi_status_label.config(text=self.wifi_status, fg=ORANGE)
+        elif kind == "connecting":
+            self.wifi_status = f"正在连接 {data.get('ssid', '')}…"
+            self.wifi_status_label.config(text=self.wifi_status, fg=ORANGE)
+            # 连接可能成功也可能失败，稍后拉一次列表看最终状态
+            self.root.after(4000, self._request_wifi_list)
+        elif kind == "disconnected":
+            self.wifi_status = "已断开"
+            self.wifi_status_label.config(text=self.wifi_status, fg=MUTED)
+            self.wifi_connected_ssid = ""
+            self.wifi_ip = ""
+        elif kind == "error":
+            self.wifi_status = f"错误：{data.get('msg', '')}"
+            self.wifi_status_label.config(text=self.wifi_status, fg="#ff7b83")
+
+    def _request_wifi_list(self) -> None:
+        if self.connected and self.port is not None:
+            try:
+                self.port.write(b"@CMD LIST\r\n")
+                self.port.flush()
+            except (serial.SerialException, OSError):
+                pass
+
+    def _refresh_wifi_list(self) -> None:
+        self.wifi_list.delete(0, "end")
+        for ap in self.wifi_aps:
+            ssid = str(ap.get("ssid", ""))
+            rssi = int(ap.get("rssi", -127) or -127)
+            sec = str(ap.get("sec", ""))
+            ch = int(ap.get("ch", 0) or 0)
+            mark = "*" if ssid and ssid == self.wifi_connected_ssid else " "
+            self.wifi_list.insert("end", f"{mark} {ssid:<22} {rssi:>5}dBm  ch{ch:<3} {sec}")
 
     def _schedule_reconnect(self) -> None:
         """串口意外断开后按退避策略自动重连。"""
@@ -417,6 +599,12 @@ class BoardMonitor:
         self.status_text.config(text="未连接")
         self.timestamp.config(text="等待串口数据")
         self.info_labels["heap"].config(text="—", fg=TEXT)
+        self.wifi_aps.clear()
+        self.wifi_selected = None
+        self.wifi_status = "—"
+        self.wifi_status_label.config(text="—", fg=MUTED)
+        self.wifi_hint.config(text="选择左侧网络后点连接")
+        self._refresh_wifi_list()
         self._draw_chart()
 
     def close(self) -> None:

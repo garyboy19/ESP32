@@ -12,7 +12,7 @@
 # components that happen to be registered before main.
 
 if(CONFIG_FIRMWARE_TFT_DASHBOARD)
-    idf_component_register(SRCS "tft_dashboard.c" INCLUDE_DIRS "")
+    idf_component_register(SRCS "tft_dashboard.c" "wifi_page.c" INCLUDE_DIRS "")
 else()
     idf_component_register(SRCS "board_test.c" INCLUDE_DIRS "")
 endif()
